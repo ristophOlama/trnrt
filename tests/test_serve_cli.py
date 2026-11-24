@@ -292,6 +292,24 @@ def test_engine_passes_other_failures_through_and_allow_compile_turns_the_assert
     assert engine.seen_env == ["1", "1", "0"]
 
 
+def test_generation_config_reaches_each_engine_and_its_app(host, engine, monkeypatch, capsys):
+    """--generation-config is the engine's to apply: serve hands it on, the engine gives it to build_app (auto without
+    the flag), and a value other than auto or none is refused by both."""
+    import trnrt.serve.api as api
+
+    assert cli.cmd_serve(["--model", "m", "--generation-config", "none"]) == 0
+    assert [_last(e.cmd, "--generation-config") for e in host.engines] == ["none", "none"]
+    got = []
+    monkeypatch.setattr(api, "build_app", lambda eng, model, **kw: got.append(kw))
+    assert cli.cmd_engine(ENGINE_ARGV) == 0
+    assert cli.cmd_engine([*ENGINE_ARGV, "--generation-config", "none"]) == 0
+    assert [kw["generation_config"] for kw in got] == ["auto", "none"]
+    for cmd in (cli.cmd_serve, cli.cmd_engine):
+        with pytest.raises(SystemExit):
+            cmd([*ENGINE_ARGV, "--generation-config", "vllm"])
+        assert "invalid choice" in capsys.readouterr().err
+
+
 def test_the_engine_reports_the_build_that_runs(engine, monkeypatch):
     """/server_info's preset is the build the engine runs (auto, --users and an earlier name resolved), not the argument."""
     import trnrt.serve.api as api

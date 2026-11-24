@@ -756,6 +756,16 @@ def add_compile_arg(ap: argparse.ArgumentParser) -> None:
     )
 
 
+def add_generation_config_arg(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "--generation-config",
+        choices=("auto", "none"),
+        default="auto",
+        help="where the sampling defaults come from: auto, the checkpoint's generation_config.json (the default); none, "
+        "the server's built-in defaults (temperature 1.0, top_p 1.0), whatever the checkpoint holds",
+    )
+
+
 def compile_env(allow_compile: bool) -> dict[str, str]:
     """The engines' environment for the compile cache: NEURON_LIBTORCH_ASSERT_CACHE_HIT=1 unless --allow-compile (then
     0, which also overrides a 1 in the caller's environment)."""
@@ -799,6 +809,7 @@ def cmd_engine(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  an API server: reachable by design
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--served-model-name", default="glm")
+    add_generation_config_arg(ap)
     add_compile_arg(ap)
     a = ap.parse_args(argv)
     # before anything imports trnrt.kernels (EngineConfig checks the DSA layouts with the kernels' parsers); the ranks the
@@ -836,7 +847,13 @@ def cmd_engine(argv: list[str]) -> int:
     # The router keeps its connections to the engines alive and drops idle ones after 30 s: uvicorn closing them first
     # (its default keep-alive is 5 s) raced a request onto a closing connection.
     # name: the engine's own directory in the production log (TRNRT_PROD_DIR), by its port, stable across restarts
-    app = build_app(eng, a.served_model_name, preset=parse_engine_args(argv).preset, name=f"engine-{a.port}")
+    app = build_app(
+        eng,
+        a.served_model_name,
+        preset=parse_engine_args(argv).preset,
+        name=f"engine-{a.port}",
+        generation_config=a.generation_config,
+    )
     serve(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=600)
     return 0
 
@@ -912,6 +929,7 @@ def cmd_serve(argv: list[str]) -> int:
     ap.add_argument("--host", default="0.0.0.0")  # noqa: S104  an API server: reachable by design
     ap.add_argument("--port", type=int, default=8000, help="the router's port; engine i listens on port + 1 + i")
     ap.add_argument("--served-model-name", default="glm")
+    add_generation_config_arg(ap)  # goes on to the engines, which apply it
     ap.add_argument(
         "--timeout-keep-alive",
         type=int,

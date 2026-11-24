@@ -1669,9 +1669,15 @@ def _tag_id(tok, tag: str) -> int | None:
     return ids[0] if len(ids) == 1 else None
 
 
-def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, name: str = "engine") -> FastAPI:
+def build_app(
+    engine: LLMEngine, model_name: str, preset: str | None = None, name: str = "engine", generation_config: str = "auto"
+) -> FastAPI:
     """The server of one engine. `preset`: the --preset it was started with, for /server_info. `name` names its
-    directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine its own, by port."""
+    directory in the production log (TRNRT_PROD_DIR): `serve` gives each engine its own, by port. `generation_config`
+    is --generation-config: "auto" takes the sampling defaults from the checkpoint's generation_config.json, "none"
+    keeps the server's own."""
+    if generation_config not in ("auto", "none"):
+        raise ValueError(f"generation_config must be 'auto' or 'none', not {generation_config!r}")
     app = FastAPI(title="TrnRT")
     loop_ = EngineLoop(engine, name)
     tok = engine.tokenizer
@@ -1683,7 +1689,7 @@ def build_app(engine: LLMEngine, model_name: str, preset: str | None = None, nam
     # TRNRT_PROMPT_CACHE_MB (serve/prompt_cache.py): a chat prompt's ids from the previous turn's; used on prompt_pool's
     # thread only, by the chat endpoint (/tokenize renders without it)
     prompt_cache = PromptCache.from_env(prompt_tok)
-    gen_defaults = generation_defaults(getattr(engine, "model_path", None))
+    gen_defaults = generation_defaults(getattr(engine, "model_path", None)) if generation_config == "auto" else {}
     if gen_defaults:
         logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
 

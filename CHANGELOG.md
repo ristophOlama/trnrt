@@ -57,6 +57,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
   do not fit their classes sent to the next page bucket.
 - Closing an engine bounds the tensor-parallel stop (120 s): a rank that never answers is named in the log and the
   workers are terminated, instead of holding the process.
+- `--generation-config auto|none` for `serve` and `engine`: `none` serves the built-in sampling defaults (temperature
+  and top_p 1.0) even when the checkpoint has a `generation_config.json`, on every endpoint (`/generate`, the
+  Responses and Messages APIs, and `/model_info`'s `preferred_sampling_params` too). `auto`, the default, takes the
+  checkpoint's values as before.
 
 ### Changed
 
