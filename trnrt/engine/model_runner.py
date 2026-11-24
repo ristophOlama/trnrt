@@ -76,7 +76,7 @@ def neuronx_cc_args(kv_dtype: torch.dtype, fp8_weights: bool = False) -> list[st
     trn2 FP8 is e4m3 with inf (max 240) and torch has no such dtype, so an fp8 KV cache or FP8 weights are
     float8_e4m3fn in the graph, which neuronx-cc rejects there: "[NCC_EVRF051] Data type F8E4M3FN is not supported
     on TRN1/TRN2 ... use the --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 flag" (SDK 2.32). The values are clamped to
-    240 on write, so the cast is exact. trnrt/platform.py adds --logical-nc-config and vllm-neuron's argument set."""
+    240 on write, so the cast is exact. trnrt/platform.py adds --logical-nc-config and its own fixed argument set."""
     from .. import platform
 
     args = platform.neuronx_cc_args(platform.runtime_target(), fp8=kv_dtype == torch.float8_e4m3fn or fp8_weights)
@@ -413,7 +413,7 @@ def alloc_kv(shapes, slots: int, dtype, device):
 
 def state_checkpoint_rows(ecfg: EngineConfig) -> int:
     """Rows of a recurrent model's state pool kept for prefix-cache checkpoints: the configured
-    count, else twice max_num_seqs (SGLang v0.5.21 int8_mamba_ckpt_size's default: 2x the active
+    count, else twice max_num_seqs (2x the active
     mamba pool)."""
     return ecfg.state_checkpoints if ecfg.state_checkpoints is not None else 2 * ecfg.max_num_seqs
 
@@ -499,7 +499,7 @@ class ModelRunner:
         self._free_slots = list(range(n_slots - 2, -1, -1))
         self._slot: dict[str, int] = {}
         self.compile_seconds: dict[tuple, float] = {}
-        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (vllm-neuron's neff_execution_count)
+        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (the neff execution count per graph)
         self.calls: dict[tuple, int] = defaultdict(int)
         # meta: trnrt/compile/capture.py traces the device run's graphs on a host without NeuronCores, through
         # a backend that writes each graph's HLO into the compile cache instead of compiling it.
@@ -646,6 +646,25 @@ class ModelRunner:
             noise[i] = rng.random(noise.shape[1], dtype=np.float32)
         return temperature, top_p, top_k, min_p, noise
 
+    def _host_extras(self, rows: list[Request | None]) -> tuple[list, tuple]:
+        """A call's token mask and penalty inputs and its variant tag (engine/host_inputs.py), or ([], ()) when no row
+        needs them, so the call takes the graph an engine without --structured-outputs / --penalties takes. The grammar
+        backend is the engine's (runner.grammar, set on the first guided request)."""
+        if not (self.ecfg.structured_outputs or self.ecfg.penalties):
+            return [], ()
+        from . import host_inputs
+
+        return host_inputs.extras(self.ecfg, self.mcfg.vocab_size, self.mcfg.eos_token_ids,
+                                  getattr(self, "grammar", None), rows)
+
+    def host_variants(self) -> list[tuple]:
+        """The variant tags this engine warms (engine/host_inputs.py variant_tags): none without the flags."""
+        if not (self.ecfg.structured_outputs or self.ecfg.penalties):
+            return []
+        from . import host_inputs
+
+        return host_inputs.variant_tags(self.ecfg, self.mcfg.vocab_size)
+
     def pad_slots(self, shape) -> np.ndarray:
         """Cache slots for padded rows: slots 1 .. page_size - 1 of the null page in turn, never slot 0.
 
@@ -676,6 +695,11 @@ class ModelRunner:
             self._synth.forget(req.rid)
         if self.state is not None:
             self.state.release(req)
+        self.release_slot(req)
+
+    def release_slot(self, req: Request) -> None:
+        """Give req's token-board slot back (also at a preemption: its recompute takes a slot again and rewrites it). Its
+        sampling generator stays, so a seeded request draws on where it was."""
         s = self._slot.pop(req.rid, None)
         if s is not None:
             self._free_slots.append(s)
@@ -799,8 +823,11 @@ class ModelRunner:
         verify followed by the graphs of its blind step, and every prefill call by the MTP pass over its rows. With
         warm pools (iopool.Pool.warm) each such block runs once per pool slot, in the order a step runs it, so a graph's
         call count, and with it its slot, advances in step with its neighbours' as in serving."""
+        from . import host_inputs
+
         t0 = time.perf_counter()
         spec_q = 1 + self.ecfg.spec_k if self.ecfg.spec_method else None
+        variants = self.host_variants()
 
         def order(xs):
             return tuple(reversed(xs)) if reverse else tuple(xs)
@@ -817,9 +844,16 @@ class ModelRunner:
                     args = [np.zeros(B, np.int64), ids, table, np.ones(B, np.int64), self.pad_slots(B),
                             *self._sampling([None] * B), BOARD, np.full(B, -1, np.int64),
                             np.full(B, self.scratch_slot, np.int64)]
+                    base = args
                     args = self._with_state("decode", args, [0] * B)  # the scratch row
                     for _ in range(self._pool_warm_reps("decode") if plain and B in self.plain_buckets and P in self.page_buckets else 0):
                         self._exec("decode", ("decode", B, P), args)
+                    # the host-input variants (--structured-outputs, --penalties): the plain decode's family only, since a
+                    # request that needs them never speculates (engine.py _dyn_want_plain)
+                    for tag in variants if plain and B in self.plain_buckets and P in self.page_buckets else ():
+                        g = self._with_state("decode", base + host_inputs.dummy(tag, B, self.mcfg.vocab_size), [0] * B)
+                        for _ in range(self._pool_warm_reps("decode")):
+                            self._exec("decode", ("decode", B, P, *tag), g)
                     if spec_q and B in self.spec_buckets and P in self.spec_page_buckets:
                         z = np.zeros((B, spec_q), np.int64)
                         samp = self._sampling([None] * (B * spec_q))
@@ -837,10 +871,15 @@ class ModelRunner:
                     args = [np.zeros(C, np.int64), np.zeros(C, np.int64), np.full(P, NULL_PAGE, np.int64),
                             self.pad_slots(C), np.zeros(1, np.int64), *self._sampling([None]), BOARD,
                             np.full(1, self.scratch_slot, np.int64)]
+                    base = args
                     args = self._with_state("prefill", args, self._prefill_state(0, C))
                     self._exec("prefill", ("prefill", C, P), args)
                     if self._mtp is not None:
                         self._warm_after_prefill(C, P)
+                    for tag in variants:  # only the post graph differs (one per C); every (C, P) key is warmed
+                        g = self._with_state("prefill", base + host_inputs.dummy(tag, 1, self.mcfg.vocab_size),
+                                             self._prefill_state(0, C))
+                        self._exec("prefill", ("prefill", C, P, *tag), g)
             for n in self.copy_buckets if self.state is not None and self.state.num_ckpt_rows else ():
                 z = np.zeros(n, np.int64)
                 self._copy_state(z, z)  # the scratch row onto itself
@@ -997,12 +1036,14 @@ class ModelRunner:
             slot[b] = r.pages[s.start // self.ps] * self.ps + s.start % self.ps
             rows[b] = r
         args = [ids, pos, table, ctx, slot, *self._sampling(rows), BOARD, read, write]
+        extra, tag = self._host_extras(rows)
+        args += extra  # nothing unless a row needs a mask or penalties (engine/host_inputs.py)
         if self.state is not None:
             srow = np.zeros(B, np.int64)  # padded rows: the scratch row
             for b, s in enumerate(seqs):
                 srow[b] = self.state.row(s.req)
             args = self._with_state("decode", args, srow)
-        out = self._exec("decode", ("decode", B, P), args)
+        out = self._exec("decode", ("decode", B, P, *tag), args)
         v = out[:n]
         self.launch_bound.alias(v, out)  # the engine reads v back: it marks out's execution done (LaunchBound)
         return v
@@ -1029,6 +1070,8 @@ class ModelRunner:
         if s.sample:
             write[0] = self.slot(r)
         args = [ids, pos, table, slot, last, *self._sampling([r if s.sample else None]), BOARD, write]
+        extra, tag = self._host_extras([r if s.sample else None])
+        args += extra  # only the post graph takes them (_piecewise)
         if self.state is not None:
             # [row, ckpt_row, k]: an in-chunk checkpoint copies the state after k of the chunk's tokens into ckpt_row;
             # none: the scratch row receives the chunk's end, k = C.
@@ -1036,7 +1079,7 @@ class ModelRunner:
             if s.mid is not None:
                 srow[1], srow[2] = s.mid[1], s.mid[0]
             args = self._with_state("prefill", args, srow)
-        return self._exec("prefill", ("prefill", C, P), args)
+        return self._exec("prefill", ("prefill", C, P, *tag), args)
 
     # -- speculative steps under overlap scheduling (engine/spec_async.py) ----------------
 
@@ -1068,6 +1111,9 @@ class ModelRunner:
         P = self.spec_page(pick_bucket(-(-min(max(s.start + Q for s in seqs), self.ecfg.max_model_len) // self.ps),
                                        self.page_buckets))
         B, slot_idx, valid, table, rows = self._spec_rows(seqs, Q, P)
+        held = [s.req.rid for s in seqs if s.req.needs_host_inputs]
+        if held:  # the verify graph takes no mask or penalties: such a request is stepped plain (engine.py)
+            raise RuntimeError(f"requests {held} need a mask or penalties and were scheduled into a speculative verify")
         cold = [(b, s) for b, s in enumerate(seqs) if not s.req.spec_ready]
         if cold:  # newest token a prompt token the host holds (engine/spec_async.py spec_host_init)
             tok, base, cur, v = (np.zeros(B, np.float32) for _ in range(4))
