@@ -35,7 +35,7 @@
 | `trnrt/kernels/` | NKI kernels: decode megakernels, prefill kernels, in-kernel collectives ([MEGAKERNELS.md](MEGAKERNELS.md)). |
 | `trnrt/compile/` | The offline pipeline: shapes from safetensors headers, capture of every graph, a neuronx-cc farm, NEFF strip. |
 | `docker/` | The image (base pinned by digest) and `check_image.py`, which checks every Neuron piece at build time. |
-| `tools/` | `graph_equiv.py` (this code builds the same graphs as a reference), `check_mixed.py` (on-device output checks), `check_docs.py` (doc links). |
+| `tools/` | `graph_equiv.py` (this code builds the same graphs as a reference), `check_mixed.py` (on-device output checks), `check_docs.py` (doc links), `bench_router_loop_gap.py` (how long the router's event loop stalls under large requests). |
 | `tests/` | The CPU suite ([DEVELOPMENT.md](DEVELOPMENT.md#tests)). |
 
 ## Request path

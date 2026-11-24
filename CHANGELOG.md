@@ -60,6 +60,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ### Changed
 
+- The router parses a request's JSON in a worker thread and forwards the client's own bytes, and its prefix trees
+  compare text by slices instead of one character at a time, so a large request stalls the streams it relays for less
+  time (the JSON parser still holds the interpreter lock while it runs).
 - The stop token that ends a request (EOS or a `stop_token_ids` entry) is no longer part of its text when the tokenizer
   does not mark it special.
 - `min_new_tokens` on the OpenAI endpoints and `spaces_between_special_tokens: false` are refused with 400;
